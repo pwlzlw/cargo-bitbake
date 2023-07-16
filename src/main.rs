@@ -70,8 +70,13 @@ impl<'cfg> PackageInfo<'cfg> {
     /// creating one as necessary
     fn registry(&self) -> CargoResult<PackageRegistry<'cfg>> {
         let mut registry = PackageRegistry::new(self.cfg)?;
-        let package = self.package()?;
-        registry.add_sources(vec![package.package_id().source_id()])?;
+
+        let members = self.ws.members();
+
+        for pkg in members {
+          registry.add_sources(vec![pkg.package_id().source_id()])?;
+        }
+
         Ok(registry)
     }
 
@@ -120,6 +125,160 @@ impl<'cfg> PackageInfo<'cfg> {
         cwd.strip_prefix(&root)
             .map(Path::to_path_buf)
             .context("Unable to if Cargo.toml is in a sub directory")
+    }
+
+    fn get_summary(&self) -> anyhow::Result<String> {
+
+      let summary = {
+
+        let default_string = "No summary found".to_string();
+
+        if !self.ws.is_virtual() {
+
+          let package = self.package()?;
+
+          let summary = package
+          .manifest()
+          .metadata()
+          .description
+          .as_ref()
+          .map_or_else(
+            || {
+                println!("No package.description set in your Cargo.toml, using package.name");
+                package.name()
+            },
+            |s| cargo::util::interning::InternedString::new(&s.trim().replace("\n", " \\\n")),
+          );
+          summary.to_string()
+        } else {
+          default_string
+        }
+      };
+
+      Ok(summary)
+    }
+
+    fn get_homepage(&self) -> anyhow::Result<String>{
+
+      let homepage = {
+
+        let default_string = "No hompage found".to_string();
+
+        if !self.ws.is_virtual() {
+
+          let package = self.package()?;
+          let metadata = package.manifest().metadata();
+
+          let page = metadata
+          .homepage
+          .as_ref()
+          .map_or_else(
+              || {
+                  println!("No package.homepage set in your Cargo.toml, trying package.repository");
+                  metadata
+                      .repository
+                      .as_ref()
+                      .map_or_else(
+                        ||
+                        default_string.as_ref() ,
+                        String::as_str,
+                      )
+              },
+              String::as_str,
+          );
+          page.to_string()
+        } else {
+          default_string
+        }
+      };
+
+      Ok(homepage)
+    }
+
+    fn get_license(&self) -> anyhow::Result<String> {
+
+      let license = {
+
+        let default_string =  license::CLOSED_LICENSE.to_string();
+
+        if !self.ws.is_virtual() {
+
+          let package = self.package()?;
+          let metadata = package.manifest().metadata();
+
+          let lic = metadata.license
+          .as_ref()
+          .map_or_else(
+            || {
+                println!("No package.license set in your Cargo.toml, trying package.license_file");
+                metadata.license_file
+                .as_ref()
+                .map_or_else(
+                    || {
+                        println!("No package.license_file set in your Cargo.toml");
+                        println!("Assuming {} license", license::CLOSED_LICENSE);
+                        license::CLOSED_LICENSE
+                    },
+                    String::as_str,
+                )
+            },
+            String::as_str,
+          );
+          lic.to_string()
+        } else {
+          default_string
+        }
+      };
+
+      Ok(license)
+    }
+
+    fn get_name(&self) -> anyhow::Result<String> {
+
+      let default_name = self.ws
+      .config()
+      .cwd()
+      .file_name()
+      .map_or_else(
+        ||
+        "No name".to_string(),
+        |osstr| osstr.to_string_lossy().to_string(),
+      );
+
+      let name = {
+
+        if !self.ws.is_virtual() {
+
+          let package = self.package()?;
+
+          package.name().to_string()
+        } else {
+          println!("No package.name");
+          default_name
+        }
+      };
+
+      Ok(name)
+    }
+
+    fn get_version(&self) -> anyhow::Result<String> {
+
+      let default_version = "0.0.0".to_string();
+
+      let version = {
+
+        if !self.ws.is_virtual() {
+
+          let package = self.package()?;
+
+          package.version().to_string()
+        } else {
+          println!("No package.version");
+          default_version
+        }
+      };
+
+      Ok(version)
     }
 }
 
@@ -188,19 +347,24 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
     // Build up data about the package we are attempting to generate a recipe for
     let md = PackageInfo::new(config, None)?;
 
-    // Our current package
-    let package = md.package()?;
-    let crate_root = package
-        .manifest_path()
-        .parent()
-        .expect("Cargo.toml must have a parent");
-
-    if package.name().contains('_') {
-        println!("Package name contains an underscore");
-    }
-
     // Resolve all dependencies (generate or use Cargo.lock as necessary)
     let resolve = md.resolve()?;
+
+    let crate_root = config.cwd();
+    let name = md.get_name()?;
+    let version = md.get_version()?;
+
+    // package description is used as BitBake summary
+    let summary = md.get_summary()?;
+
+    // package homepage (or source code location)
+    let homepage = md.get_homepage()?;
+
+    // package license
+    let license = md.get_license()?;
+
+    // compute the relative directory into the repo our Cargo.toml is at
+    let rel_dir = md.rel_dir()?;
 
     // build the crate URIs
     let mut src_uri_extras = vec![];
@@ -210,9 +374,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         .filter_map(|pkg| {
             // get the source info for this package
             let src_id = pkg.source_id();
-            if pkg.name() == package.name() {
-                None
-            } else if src_id.is_registry() {
+            if src_id.is_registry() {
                 // this package appears in a crate registry
                 Some(format!(
                     "    crate://{}/{}/{} \\\n",
@@ -287,55 +449,9 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         })
         .collect::<Vec<String>>();
 
+
     // sort the crate list
     src_uris.sort();
-
-    // root package metadata
-    let metadata = package.manifest().metadata();
-
-    // package description is used as BitBake summary
-    let summary = metadata.description.as_ref().map_or_else(
-        || {
-            println!("No package.description set in your Cargo.toml, using package.name");
-            package.name()
-        },
-        |s| cargo::util::interning::InternedString::new(&s.trim().replace("\n", " \\\n")),
-    );
-
-    // package homepage (or source code location)
-    let homepage = metadata
-        .homepage
-        .as_ref()
-        .map_or_else(
-            || {
-                println!("No package.homepage set in your Cargo.toml, trying package.repository");
-                metadata
-                    .repository
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("No package.repository set in your Cargo.toml"))
-            },
-            Ok,
-        )?
-        .trim();
-
-    // package license
-    let license = metadata.license.as_ref().map_or_else(
-        || {
-            println!("No package.license set in your Cargo.toml, trying package.license_file");
-            metadata.license_file.as_ref().map_or_else(
-                || {
-                    println!("No package.license_file set in your Cargo.toml");
-                    println!("Assuming {} license", license::CLOSED_LICENSE);
-                    license::CLOSED_LICENSE
-                },
-                String::as_str,
-            )
-        },
-        String::as_str,
-    );
-
-    // compute the relative directory into the repo our Cargo.toml is at
-    let rel_dir = md.rel_dir()?;
 
     // license files for the package
     let mut lic_files = vec![];
@@ -372,9 +488,9 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         // its a tag so nothing needed
         "".into()
     };
-
+  
     // build up the path
-    let recipe_path = PathBuf::from(format!("{}_{}.bb", package.name(), package.version()));
+    let recipe_path = PathBuf::from(format!("{}_{}.bb", name, version));
 
     // Open the file where we'll write the BitBake recipe
     let mut file = OpenOptions::new()
@@ -389,8 +505,8 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
     write!(
         file,
         include_str!("bitbake.template"),
-        name = package.name(),
-        version = package.version(),
+        name = name,
+        version = version,
         summary = summary,
         homepage = homepage,
         license = license,
